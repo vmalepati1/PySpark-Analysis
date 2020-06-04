@@ -38,7 +38,6 @@ from pyspark.ml import Pipeline
 import xgboost
 
 
-
 #os.environ['PYSPARK_PYTHON'] = './python_env/py27/bin/python2' 
 #os.environ['PYSPARK_SUBMIT_ARGS'] = '--jars xgboost4j-spark-0.72.jar,xgboost4j-0.72.jar pyspark-shell'
 
@@ -226,13 +225,19 @@ if __name__ == '__main__':
 
 
     # dt, site_id, node_desc, us_load
-    df0 = spark.sql("select dt, cast(site_id as String) as site_id, COALESCE(node_desc, 'null') as node_desc, us_load from inp.weekly_utilization_node_gnis where where us_load is not null")
-    df0.createOrReplaceTempView("tmp_df")
+    # Load from database
+##    df0 = spark.sql("select dt, cast(site_id as String) as site_id, COALESCE(node_desc, 'null') as node_desc, us_load from inp.weekly_utilization_node_gnis where where us_load is not null")
+##    df0.createOrReplaceTempView("tmp_df")
+##
+##    df1 = spark.sql("select dt, site_id, node_desc, sum(us_load) as value from tmp_df group by dt, site_id, node_desc")
+##    df1.createOrReplaceTempView("tmp_df1")
+##
+##    df2 = spark.sql("select dt as date, concat(site_id,node_desc) as market, value from tmp_df1")
 
-    df1 = spark.sql("select dt, site_id, node_desc, sum(us_load) as value from tmp_df group by dt, site_id, node_desc")
-    df1.createOrReplaceTempView("tmp_df1")
-
-    df2 = spark.sql("select dt as date, concat(site_id,node_desc) as market, value from tmp_df1")
+    # Load from csv
+    df = spark.read.format("csv").option("inferSchema", 
+           True).option("header", True).load(file_location)
+    display(df)
 
     df = df2.dropna()
 
