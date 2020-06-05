@@ -1,8 +1,11 @@
-import os
-os.environ['PYSPARK_SUBMIT_ARGS'] = '--jars xgboost4j-spark-0.72.jar,xgboost4j-0.72.jar pyspark-shell'
+# UNCOMMENT TWO LINES BELOW AND SPECIFY PYSPARK JAR LOCATIONS
+# Commented in this version because Databricks automatically manages jar dependencies for pyspark
+# import os
+# os.environ['PYSPARK_SUBMIT_ARGS'] = '--jars /dbfs/FileStore/tables/xgboost4j_spark_0_72-2403f.jar,/dbfs/FileStore/tables/xgboost4j_0_72-53fc9.jar pyspark-shell'
+
 # Default Java is 11 but need to use 8 for PySpark
-java8_location= 'C:/Program Files/Java/jdk1.8.0_251'
-os.environ['JAVA_HOME'] = java8_location
+# java8_location= 'C:/Program Files/Java/jdk1.8.0_251'
+# os.environ['JAVA_HOME'] = java8_location
 
 import pandas as pd
 import numpy as np
@@ -18,6 +21,11 @@ import time
 from datetime import datetime, timedelta
 
 import pyspark
+from pyspark import keyword_only
+from pyspark.ml.base import Estimator
+from pyspark.ml.param import Params, Param, TypeConverters
+from pyspark.ml.feature import VectorSlicer
+from pyspark.ml.param.shared import HasOutputCol
 from pyspark.sql import types, SQLContext
 from pyspark.sql.types import StructType, StructField
 
@@ -32,6 +40,8 @@ from pyspark.mllib.regression import LabeledPoint
 from pyspark.mllib.classification import LogisticRegressionWithLBFGS, LogisticRegressionModel
 from pyspark.ml.feature import StringIndexer, VectorAssembler
 from pyspark.ml import Pipeline
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml.evaluation import RegressionEvaluator
 import xgboost
 
 #os.environ['PYSPARK_PYTHON'] = './python_env/py27/bin/python2' 
@@ -212,19 +222,163 @@ def feat_generator(input_data):
     if 'index' in input_data.columns:
         input_data.drop(['index'], axis=1, inplace=True)
     return input_data
+  
+def ExtractFeatureImp(featureImp, dataset, featuresCol):
+    """
+    Takes in a feature importance from a random forest / GBT model and map it to the column names
+    Output as a pandas dataframe for easy reading
+    
+    rf = RandomForestClassifier(featuresCol="features")
+    mod = rf.fit(train)
+    ExtractFeatureImp(mod.featureImportances, train, "features")
+    """
+    
+    list_extract = []
+    for i in dataset.schema[featuresCol].metadata["ml_attr"]["attrs"]:
+        list_extract = list_extract + dataset.schema[featuresCol].metadata["ml_attr"]["attrs"][i]
+    varlist = pd.DataFrame(list_extract)
+    varlist['score'] = varlist['idx'].apply(lambda x: featureImp[x])
+    return(varlist.sort_values('score', ascending = False))
+
+class FeatureImpSelector(Estimator, HasOutputCol):
+    """
+    Uses feature importance score to select features for training
+    Takes either the top n features or those above a certain threshold score
+    estimator should either be a DecisionTreeClassifier, RandomForestClassifier or GBTClassifier
+    featuresCol is inferred from the estimator
+    """
+    
+    estimator = Param(Params._dummy(), "estimator", "estimator to be cross-validated")
+    
+    selectorType = Param(Params._dummy(), "selectorType",
+                         "The selector type of the FeatureImpSelector. " +
+                         "Supported options: numTopFeatures (default), threshold",
+                         typeConverter=TypeConverters.toString)
+    
+    numTopFeatures = \
+        Param(Params._dummy(), "numTopFeatures",
+              "Number of features that selector will select, ordered by descending feature imp score. " +
+              "If the number of features is < numTopFeatures, then this will select " +
+              "all features.", typeConverter=TypeConverters.toInt)
+    
+    
+    threshold = Param(Params._dummy(), "threshold", "The lowest feature imp score for features to be kept.",
+                typeConverter=TypeConverters.toFloat)
+    
+    @keyword_only
+    def __init__(self, estimator = None, selectorType = "numTopFeatures",
+                 numTopFeatures = 20, threshold = 0.01, outputCol = "features"):
+        
+        super(FeatureImpSelector, self).__init__()
+        self._setDefault(selectorType="numTopFeatures", numTopFeatures=20, threshold=0.01)
+        kwargs = self._input_kwargs
+        self._set(**kwargs)
+        
+    def setParams(self, estimator = None, selectorType = "numTopFeatures",
+                 numTopFeatures = 20, threshold = 0.01, outputCol = "features"):
+        """
+        setParams(self, estimator = None, selectorType = "numTopFeatures",
+                 numTopFeatures = 20, threshold = 0.01, outputCol = "features")
+        Sets params for this ChiSqSelector.
+        """
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
+
+    def setEstimator(self, value):
+        """
+        Sets the value of :py:attr:`estimator`.
+        """
+        return self._set(estimator=value)   
+    
+    def getEstimator(self):
+        """
+        Gets the value of estimator or its default value.
+        """
+        return self.getOrDefault(self.estimator)
+    
+    def setSelectorType(self, value):
+        """
+        Sets the value of :py:attr:`selectorType`.
+        """
+        return self._set(selectorType=value)
+
+    def getSelectorType(self):
+        """
+        Gets the value of selectorType or its default value.
+        """
+        return self.getOrDefault(self.selectorType)
+    
+    def setNumTopFeatures(self, value):
+        """
+        Sets the value of :py:attr:`numTopFeatures`.
+        Only applicable when selectorType = "numTopFeatures".
+        """
+        return self._set(numTopFeatures=value)
+
+    def getNumTopFeatures(self):
+        """
+        Gets the value of numTopFeatures or its default value.
+        """
+        return self.getOrDefault(self.numTopFeatures)
+    
+    def setThreshold(self, value):
+        """
+        Sets the value of :py:attr:`Threshold`.
+        Only applicable when selectorType = "threshold".
+        """
+        return self._set(threshold=value)
+
+    def getThreshold(self):
+        """
+        Gets the value of threshold or its default value.
+        """
+        return self.getOrDefault(self.threshold)
+    
+    def _fit(self, dataset):
+
+        est = self.getOrDefault(self.estimator)
+        nfeatures = self.getOrDefault(self.numTopFeatures)
+        threshold = self.getOrDefault(self.threshold)
+        selectorType = self.getOrDefault(self.selectorType)
+        outputCol = self.getOrDefault(self.outputCol)
+
+        # Fit classifier & extract feature importance
+        
+        mod = est.fit(dataset)
+        dataset2 = mod.transform(dataset)
+        varlist = ExtractFeatureImp(mod.featureImportances, dataset2, est.getFeaturesCol())
+
+        if (selectorType == "numTopFeatures"):
+            varidx = [x for x in varlist['idx'][0:nfeatures]]
+        elif (selectorType == "threshold"):
+            varidx = [x for x in varlist[varlist['score'] > threshold]['idx']]
+        else:
+            raise NameError("Invalid selectorType")
+            
+        # Extract relevant columns
+        return VectorSlicer(inputCol = est.getFeaturesCol(),
+                           outputCol = outputCol,
+                           indices = varidx)
 
 if __name__ == '__main__':
     
 
-    spark = SparkSession.builder.appName("SparkXgboostforNPA").enableHiveSupport().getOrCreate()
+    # Optional: download Jars from online Maven repository instead of specifying local paths in first two lines
+    # of this file.
+#     conf = pyspark.SparkConf()
+#     conf.set("spark.jars.packages", "ml.dmlc:xgboost4j:0.72,ml.dmlc:xgboost4j-spark:0.72")
+    
+    spark = SparkSession.builder.appName("SparkXgboostforNPA").enableHiveSupport()\
+      .getOrCreate()
+      
     # Enable Arrow-based columnar data transfers
-    # spark.conf.set("spark.sql.execution.arrow.enabled", "true")
+    spark.conf.set("spark.sql.execution.arrow.enabled", "true")
     print("Session created!")
     sc = spark.sparkContext
     sc.setLogLevel("INFO")
-    sc.addPyFile("sparkxgb.zip")
+    sc.addPyFile("/dbfs/FileStore/tables/sparkxgb.zip")
     sqlContext = SQLContext(sc)
-
+    
     from sparkxgb import XGBoostEstimator
 
     # dt, site_id, node_desc, us_load
@@ -238,10 +392,7 @@ if __name__ == '__main__':
 ##    df2 = spark.sql("select dt as date, concat(site_id,node_desc) as market, value from tmp_df1")
 
     # Load from csv
-    file_location = 'usinput.csv/test_sample.csv'
-    
-    df = spark.read.format("csv").option("inferSchema", 
-           True).option("header", True).load(file_location)
+    df = spark.read.load("/FileStore/parquet/usinput")
 
     # Concat sites and node_desc into market column
     df = df.withColumn("market",concat(col("sites"),col("node_desc"))).drop("sites").drop("node_desc")
@@ -261,6 +412,7 @@ if __name__ == '__main__':
 
     # Convert to pandas dataframe
     print('Starting conversion')
+    # input_data=df.orderBy('value').limit(50000).select("*").toPandas()
     input_data=df.select("*").toPandas()
     print('Converted')
     input_data['dt'] = pd.to_datetime(input_data.date)
@@ -269,8 +421,11 @@ if __name__ == '__main__':
     # two level index
     input_data = input_data.set_index(['code','dt'])
     input_data.fillna(method='ffill', inplace=True)
+    print('Starting feature generation')
     input_data = feat_generator(input_data)
-
+    print('Finished feature generation')
+    
+    print('Performing sliding window')
     # shift生成时间序列
     shifted_input_data = shift_by_stock_code(input_data.set_index(['code','dt']), tracking_days=5, 
                         mode='backward', del_nan=True)
@@ -278,6 +433,7 @@ if __name__ == '__main__':
     shifted_input_data[(shifted_input_data<-10000000)]=np.nan
 
     shifted_input_data.dropna(axis=0,inplace=True)
+    print('Finished sliding window')
 
     # make label
     shifted_input_data.rename(columns={'Y_000_day_before':'Y'}, inplace=True)
@@ -319,18 +475,52 @@ if __name__ == '__main__':
       .setInputCols(features)\
       .setOutputCol("features")
 
-    xgboost = XGBoostEstimator(
-        # evalMetric="rmse",
+    xgboostEstimator = XGBoostEstimator(
+        eval_metric="rmse",
         featuresCol="features", 
         labelCol="Y",
-        # numEarlyStoppingRounds=5,
+        objective="reg:linear",
         predictionCol="prediction",
     )
-
-    pipeline = Pipeline().setStages([vectorAssembler, xgboost])
-
-    model = pipeline.fit(train_df)
-
-    model.transform(test_df).select(col("prediction")).show()
-
     
+    fis = FeatureImpSelector(estimator = xgboostEstimator, selectorType = "numTopFeatures",
+                         numTopFeatures = int(len(features) * 0.7), outputCol = "features_subset")
+    
+    xgboostEstimator2 = XGBoostEstimator(
+        eval_metric="rmse",
+        featuresCol="features_subset", 
+        labelCol="Y",
+        objective="reg:linear",
+        predictionCol="prediction_2",
+    )
+
+#     pipeline = Pipeline().setStages([vectorAssembler, fis, xgboostEstimator2])
+
+    pipeline = Pipeline().setStages([vectorAssembler, xgboostEstimator])
+
+    paramGrid = ParamGridBuilder() \
+        .addGrid(xgboostEstimator.max_depth, [5, 6]) \
+        .addGrid(xgboostEstimator.eta, [0.1, 0.4]) \
+        .build()
+
+    crossval = CrossValidator(estimator=pipeline,
+                          estimatorParamMaps=paramGrid,
+                          evaluator=RegressionEvaluator().setLabelCol("Y").setPredictionCol("prediction"),
+                          numFolds=3)
+
+    # Run cross-validation, and choose the best set of parameters.
+    cvModel = crossval.fit(train_df)
+    
+    # MAPE evaluate
+    # MAPE evaluate
+    y_train_hat = np.array(cvModel.transform(train_df).select(col("prediction")).collect())
+    y_train = np.array(train_df.select(col("Y")).collect())
+    y_test_hat = np.array(cvModel.transform(test_df).select(col("prediction")).collect())
+    y_test = np.array(test_df.select(col("Y")).collect())
+
+    print()
+    print("MAPE train {}, test {}.".format(np.mean(mape(y_train, y_train_hat)).round(4),
+                                                   np.mean(mape(y_test, y_test_hat)).round(4)))
+    print()
+    
+    cvModel.save(sc, "/dbfs/FileStore/models/test")
